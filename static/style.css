@@ -149,6 +149,21 @@ header p {
     border-color: var(--primary);
 }
 
+.fill-blank-input {
+    width: 100%;
+    padding: 0.9rem 1rem;
+    border: 2px solid var(--border);
+    border-radius: 8px;
+    font-size: 1rem;
+    color: var(--text);
+    background: white;
+}
+
+.fill-blank-input:focus {
+    outline: none;
+    border-color: var(--primary);
+}
+
 /* Buttons */
 .btn {
     display: inline-flex;

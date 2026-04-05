@@ -1,14 +1,16 @@
 # quizTool
 
-quizTool is a Flask web app that generates multiple-choice quizzes from uploaded PDF files. It can use OpenRouter for AI-generated questions or fall back to demo questions when no API key is configured.
+quizTool is a Flask web app that generates quizzes from uploaded PDF files. It supports multiple-choice, fill-in-the-blank, and mixed question types. It uses OpenRouter for AI-generated questions when configured and falls back to locally generated demo questions when no API key is available.
 
 ## Features
 
 - Upload a PDF and generate a quiz from its content
-- Choose question count and difficulty level
+- Choose question count, difficulty level, and question type
 - AI-powered generation with OpenRouter
 - Demo mode fallback when no API key is available
+- PDF text extraction with PyPDF2
 - Quiz review with scoring and explanations
+- Mixed quizzes that include both multiple-choice and fill-in-the-blank questions
 
 ## Tech Stack
 

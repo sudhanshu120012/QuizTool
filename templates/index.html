@@ -10,7 +10,7 @@
     <div class="container">
         <header>
             <h1>AI Quiz Generator</h1>
-            <p>Upload a PDF and generate a customized quiz</p>
+            <p>Upload a PDF and generate a multiple-choice quiz from its content</p>
         </header>
 
         <!-- Upload Section -->
@@ -45,6 +45,15 @@
                         <option value="hard">Hard</option>
                     </select>
                 </div>
+
+                <div class="control-group">
+                    <label for="question-type">Question Type</label>
+                    <select id="question-type">
+                        <option value="mcq" selected>Multiple Choice</option>
+                        <option value="fill_in_the_blank">Fill in the Blank</option>
+                        <option value="mixed">Mixed</option>
+                    </select>
+                </div>
             </div>
 
             <button id="generate-btn" class="btn btn-primary" disabled>
@@ -55,6 +64,10 @@
             <div class="demo-notice" id="demo-notice" hidden>
                 <span class="info-icon">ℹ️</span>
                 <span>Running in demo mode. Add your OpenRouter API key to .env for AI-generated questions.</span>
+            </div>
+
+            <div class="quiz-format-note">
+                Choose mixed to generate both multiple-choice and fill-in-the-blank questions.
             </div>
         </section>
 
@@ -73,6 +86,7 @@
                 <h2>Quiz</h2>
                 <div class="quiz-info">
                     <span id="quiz-difficulty" class="badge"></span>
+                    <span id="quiz-mix" class="badge mix-badge"></span>
                     <span id="quiz-progress">Question 1 of 10</span>
                 </div>
             </div>

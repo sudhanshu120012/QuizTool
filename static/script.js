@@ -4,6 +4,7 @@ const pdfInput = document.getElementById('pdf-input');
 const fileName = document.getElementById('file-name');
 const numQuestionsSelect = document.getElementById('num-questions');
 const difficultySelect = document.getElementById('difficulty');
+const questionTypeSelect = document.getElementById('question-type');
 const generateBtn = document.getElementById('generate-btn');
 const demoNotice = document.getElementById('demo-notice');
 
@@ -37,6 +38,16 @@ let quizData = [];
 let currentQuestion = 0;
 let userAnswers = {};
 let isDemoMode = false;
+let currentQuestionType = 'mcq';
+
+function escapeHtml(value) {
+    return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+}
 
 // Event Listeners
 uploadArea.addEventListener('click', () => pdfInput.click());
@@ -103,6 +114,7 @@ async function generateQuiz() {
 
     const numQuestions = numQuestionsSelect.value;
     const difficulty = difficultySelect.value;
+    const questionType = questionTypeSelect.value;
 
     generateBtn.disabled = true;
     generateBtn.querySelector('.btn-text').hidden = true;
@@ -114,6 +126,7 @@ async function generateQuiz() {
     formData.append('pdf', selectedFile);
     formData.append('num_questions', numQuestions);
     formData.append('difficulty', difficulty);
+    formData.append('question_type', questionType);
 
     try {
         showLoading('Analyzing PDF content...');
@@ -136,6 +149,7 @@ async function generateQuiz() {
             demoNotice.hidden = false;
         }
 
+        currentQuestionType = questionType;
         quizData = data.questions;
         currentQuestion = 0;
         userAnswers = {};
@@ -155,6 +169,11 @@ function startQuiz(difficulty) {
     showSection(quizSection);
     quizDifficulty.textContent = difficulty;
     quizDifficulty.className = `badge ${difficulty}`;
+    const typeLabel = currentQuestionType === 'mcq' ? 'Multiple Choice' : currentQuestionType === 'fill_in_the_blank' ? 'Fill in the Blank' : 'Mixed';
+    const quizMix = document.getElementById('quiz-mix');
+    if (quizMix) {
+        quizMix.textContent = typeLabel;
+    }
     renderQuestion();
     updateNavigation();
 }
@@ -162,27 +181,39 @@ function startQuiz(difficulty) {
 function renderQuestion() {
     const question = quizData[currentQuestion];
     const letters = ['A', 'B', 'C', 'D'];
-
+    const isFillInBlank = question.type === 'fill_in_the_blank';
+    const safeQuestion = escapeHtml(question.question);
     quizContainer.innerHTML = `
         <div class="question-card">
             <div class="question-number">Question ${currentQuestion + 1} of ${quizData.length}</div>
-            <div class="question-text">${question.question}</div>
-            <div class="options-list">
-                ${question.options.map((option, index) => `
-                    <div class="option-item ${userAnswers[currentQuestion] === letters[index] ? 'selected' : ''}" 
-                         data-index="${index}" data-letter="${letters[index]}">
-                        <span class="option-letter">${letters[index]}</span>
-                        <span class="option-text">${option}</span>
-                    </div>
-                `).join('')}
-            </div>
+            <div class="question-type-label">${isFillInBlank ? 'Fill in the Blank' : 'Multiple Choice'}</div>
+            <div class="question-text">${safeQuestion}</div>
+            ${isFillInBlank ? `
+                <input type="text" class="fill-blank-input" id="fill-blank-input" placeholder="Type your answer here" value="${escapeHtml(userAnswers[currentQuestion] || '')}">
+            ` : `
+                <div class="options-list">
+                    ${question.options.map((option, index) => `
+                        <div class="option-item ${userAnswers[currentQuestion] === letters[index] ? 'selected' : ''}" 
+                             data-index="${index}" data-letter="${letters[index]}">
+                            <span class="option-letter">${letters[index]}</span>
+                            <span class="option-text">${escapeHtml(option)}</span>
+                        </div>
+                    `).join('')}
+                </div>
+            `}
         </div>
     `;
 
-    // Add click handlers to options
-    quizContainer.querySelectorAll('.option-item').forEach(option => {
-        option.addEventListener('click', () => selectOption(option));
-    });
+    if (isFillInBlank) {
+        const input = document.getElementById('fill-blank-input');
+        input.addEventListener('input', (e) => {
+            userAnswers[currentQuestion] = e.target.value.trim();
+        });
+    } else {
+        quizContainer.querySelectorAll('.option-item').forEach(option => {
+            option.addEventListener('click', () => selectOption(option));
+        });
+    }
 
     updateProgress();
 }
@@ -241,7 +272,11 @@ function showResults() {
 
     let correctCount = 0;
     quizData.forEach((question, index) => {
-        if (userAnswers[index] === question.answer) {
+        const isFillInBlank = question.type === 'fill_in_the_blank';
+        const userAnswer = userAnswers[index];
+        const normalizedUserAnswer = (userAnswer || '').trim().toLowerCase();
+        const normalizedCorrectAnswer = (question.answer || '').trim().toLowerCase();
+        if (isFillInBlank ? normalizedUserAnswer === normalizedCorrectAnswer : userAnswer === question.answer) {
             correctCount++;
         }
     });
@@ -252,20 +287,34 @@ function showResults() {
 
     resultsContainer.innerHTML = quizData.map((question, index) => {
         const userAnswer = userAnswers[index];
-        const isCorrect = userAnswer === question.answer;
+        const isFillInBlank = question.type === 'fill_in_the_blank';
+        const isCorrect = isFillInBlank
+            ? (userAnswer || '').trim().toLowerCase() === (question.answer || '').trim().toLowerCase()
+            : userAnswer === question.answer;
         const optionLetters = ['A', 'B', 'C', 'D'];
+
+        if (isFillInBlank) {
+            return `
+                <div class="result-item ${isCorrect ? 'correct' : 'incorrect'}">
+                    <div class="result-question">${index + 1}. ${escapeHtml(question.question)}</div>
+                    <div class="result-your-answer">Your answer: ${escapeHtml(userAnswer || 'Not answered')}</div>
+                    <div class="result-correct-answer">Correct answer: ${escapeHtml(question.answer)}</div>
+                    <div class="result-explanation"><strong>Explanation:</strong> ${escapeHtml(question.explanation)}</div>
+                </div>
+            `;
+        }
 
         return `
             <div class="result-item ${isCorrect ? 'correct' : 'incorrect'}">
-                <div class="result-question">${index + 1}. ${question.question}</div>
+                <div class="result-question">${index + 1}. ${escapeHtml(question.question)}</div>
                 <div class="result-your-answer">
-                    Your answer: ${userAnswer ? `${userAnswer}. ${question.options[optionLetters.indexOf(userAnswer)] || 'Not answered'}` : 'Not answered'}
+                    Your answer: ${userAnswer ? `${escapeHtml(userAnswer)}. ${escapeHtml(question.options[optionLetters.indexOf(userAnswer)] || 'Not answered')}` : 'Not answered'}
                 </div>
                 <div class="result-correct-answer">
-                    Correct answer: ${question.answer}. ${question.options[optionLetters.indexOf(question.answer)]}
+                    Correct answer: ${escapeHtml(question.answer)}. ${escapeHtml(question.options[optionLetters.indexOf(question.answer)])}
                 </div>
                 <div class="result-explanation">
-                    <strong>Explanation:</strong> ${question.explanation}
+                    <strong>Explanation:</strong> ${escapeHtml(question.explanation)}
                 </div>
             </div>
         `;

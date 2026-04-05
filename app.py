@@ -1,11 +1,14 @@
-from flask import Flask, request, jsonify, render_template
-from flask_cors import CORS
-import PyPDF2
-import requests
-import os
 import json
-import io
+import os
+import random
+import re
+from json import JSONDecodeError
+
+import requests
 from dotenv import load_dotenv
+from flask import Flask, jsonify, render_template, request
+from flask_cors import CORS
+from PyPDF2 import PdfReader
 
 load_dotenv()
 
@@ -13,259 +16,179 @@ app = Flask(__name__)
 CORS(app)
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 
 
-def extract_text_from_pdf(pdf_file):
-    """Extract text from uploaded PDF file"""
-    pdf_reader = PyPDF2.PdfReader(pdf_file)
-    text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text() + "\n"
-    return text.strip()
+def extract_text_from_pdf(file_storage):
+    reader = PdfReader(file_storage)
+    text = []
+    for page in reader.pages:
+        text.append(page.extract_text() or "")
+    return "\n".join(text).strip()
 
 
-def split_text_into_chunks(text, chunk_size=2000, overlap=200):
-    """Split text into overlapping chunks"""
-    if len(text) <= chunk_size:
-        return [text]
-
+def chunk_text(text, max_length=600):
+    words = text.split()
     chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk)
-        start = end - overlap
+    current = []
+    current_len = 0
+    for word in words:
+        if current_len + len(word) + 1 > max_length and current:
+            chunks.append(" ".join(current))
+            current = [word]
+            current_len = len(word)
+        else:
+            current.append(word)
+            current_len += len(word) + 1
+    if current:
+        chunks.append(" ".join(current))
     return chunks
 
 
-def call_openrouter(prompt, model="openrouter/hunter-alpha"):
-    """Call OpenRouter API to generate questions"""
-    if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == "your_openrouter_api_key_here":
-        return None
-
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost:5000",
-        "X-Title": "Quiz Generator",
+def build_mcq(question_text, answer, distractors, explanation):
+    options = [answer] + distractors[:3]
+    while len(options) < 4:
+        options.append(f"Option {len(options) + 1}")
+    random.shuffle(options)
+    letters = ["A", "B", "C", "D"]
+    return {
+        "type": "mcq",
+        "question": question_text,
+        "options": options,
+        "answer": letters[options.index(answer)],
+        "explanation": explanation,
     }
 
-    data = {
-        "model": model,
-        "messages": [
+
+def build_fill_blank(question_text, answer, explanation):
+    return {
+        "type": "fill_in_the_blank",
+        "question": question_text,
+        "answer": answer,
+        "explanation": explanation,
+    }
+
+
+def normalize_questions(raw_questions, question_type, num_questions):
+    questions = []
+    for index, item in enumerate(raw_questions[:num_questions]):
+        base_question = item.get("question") or f"Question {index + 1}"
+        answer = item.get("answer") or "Answer"
+        explanation = item.get("explanation") or "Explanation unavailable."
+        distractors = item.get("options") or []
+
+        if question_type == "fill_in_the_blank":
+            questions.append(build_fill_blank(base_question, answer, explanation))
+        elif question_type == "mixed":
+            if index % 2 == 0:
+                questions.append(
+                    build_mcq(base_question, answer, distractors, explanation)
+                )
+            else:
+                questions.append(build_fill_blank(base_question, answer, explanation))
+        else:
+            questions.append(build_mcq(base_question, answer, distractors, explanation))
+    return questions
+
+
+def generate_demo_questions(text, question_type, num_questions, difficulty):
+    chunks = chunk_text(text) or ["Sample content"]
+    raw_questions = []
+    for index in range(num_questions):
+        chunk = chunks[index % len(chunks)]
+        words = re.findall(r"[A-Za-z0-9']+", chunk)
+        answer = words[0] if words else f"Answer {index + 1}"
+        raw_questions.append(
             {
-                "role": "system",
-                "content": "You are a quiz generation expert. Generate questions in valid JSON array format only. No markdown, no explanation.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.7,
-        "max_tokens": 4000,
-    }
-
-    try:
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=data,
-            timeout=60,
+                "question": f"According to the source, what is highlighted in section {index + 1}?",
+                "answer": answer,
+                "options": [
+                    answer,
+                    f"{answer} alt 1",
+                    f"{answer} alt 2",
+                    f"{answer} alt 3",
+                ],
+                "explanation": f"This answer is derived from the extracted PDF content for {difficulty} difficulty.",
+            }
         )
-        response.raise_for_status()
-        result = response.json()
-        content = result["choices"][0]["message"]["content"]
-        return content
-    except Exception as e:
-        print(f"OpenRouter API error: {e}")
-        return None
+    return normalize_questions(raw_questions, question_type, num_questions)
 
 
-def build_prompt(chunk, num_questions, difficulty):
-    """Build the prompt for question generation"""
-    difficulty_rules = {
-        "easy": "Focus on basic facts, definitions, and simple recall. Questions should test direct information from the text.",
-        "medium": "Focus on concept understanding and slight reasoning. Questions should require understanding relationships between ideas.",
-        "hard": "Focus on inference, application, and multi-step thinking. Questions should require analysis and critical evaluation.",
-    }
-
-    prompt = f"""Generate exactly {num_questions} {difficulty}-level multiple-choice questions from the following text.
+def generate_openrouter_questions(text, question_type, num_questions, difficulty):
+    prompt = f"""
+You generate quiz questions from PDF content.
+Return ONLY valid JSON with this schema:
+{{
+  "questions": [
+    {{
+      "question": "...",
+      "answer": "...",
+      "options": ["...", "...", "...", "..."],
+      "explanation": "..."
+    }}
+  ]
+}}
 
 Rules:
-- {difficulty_rules.get(difficulty, difficulty_rules["medium"])}
-- Each question MUST have exactly 4 options (A, B, C, D)
-- Each question must have a clear correct answer
-- Provide a brief explanation for the correct answer
-- Return ONLY a valid JSON array, no other text
+- Generate {num_questions} questions.
+- Difficulty: {difficulty}.
+- Question type: {question_type}.
+- For fill_in_the_blank questions, omit the options field.
+- For mixed quizzes, alternate between multiple-choice and fill-in-the-blank.
+- Keep answers concise and directly supported by the source.
 
-Format:
-[
-  {{
-    "question": "Question text here?",
-    "options": ["Option A", "Option B", "Option C", "Option D"],
-    "answer": "A",
-    "difficulty": "{difficulty}",
-    "explanation": "Brief explanation of why this is correct"
-  }}
-]
+Source text:
+{text[:12000]}
+""".strip()
 
-Text:
-{chunk}"""
-    return prompt
+    response = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:5000",
+            "X-Title": "quizTool",
+        },
+        json={
+            "model": OPENROUTER_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+        },
+        timeout=90,
+    )
+    response.raise_for_status()
+    content = response.json()["choices"][0]["message"]["content"]
+    data = parse_json_payload(content)
+    questions = data.get("questions", []) if isinstance(data, dict) else []
+    if not questions:
+        raise ValueError("OpenRouter returned no questions")
+    return normalize_questions(questions, question_type, num_questions)
 
 
-def parse_questions_from_response(response_text):
-    """Parse questions from LLM response"""
-    if not response_text:
-        return []
-
+def parse_json_payload(content):
     try:
-        # Try to find JSON array in the response
-        response_text = response_text.strip()
+        return json.loads(content)
+    except JSONDecodeError:
+        pass
 
-        # If response starts with ```json, extract it
-        if response_text.startswith("```"):
-            lines = response_text.split("\n")
-            json_lines = []
-            in_json = False
-            for line in lines:
-                if line.strip().startswith("```"):
-                    in_json = not in_json
-                    continue
-                if in_json:
-                    json_lines.append(line)
-            response_text = "\n".join(json_lines)
-
-        questions = json.loads(response_text)
-        return questions if isinstance(questions, list) else []
-    except json.JSONDecodeError:
-        # Try to extract JSON array from text
+    fenced = re.search(
+        r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL | re.IGNORECASE
+    )
+    if fenced:
         try:
-            start = response_text.find("[")
-            end = response_text.rfind("]") + 1
-            if start != -1 and end != 0:
-                json_str = response_text[start:end]
-                questions = json.loads(json_str)
-                return questions if isinstance(questions, list) else []
-        except:
+            return json.loads(fenced.group(1))
+        except JSONDecodeError:
             pass
-        return []
 
+    start = content.find("{")
+    end = content.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(content[start : end + 1])
+        except JSONDecodeError:
+            pass
 
-def generate_demo_questions(num_questions, difficulty):
-    """Generate demo questions when API key is not available"""
-    demo_questions = []
-
-    samples = {
-        "easy": [
-            {
-                "question": "What is the main purpose of reading comprehension?",
-                "options": [
-                    "To memorize text",
-                    "To understand meaning",
-                    "To read faster",
-                    "To skip pages",
-                ],
-                "answer": "B",
-                "explanation": "Reading comprehension focuses on understanding the meaning of text.",
-            },
-            {
-                "question": "Which of these is a key reading skill?",
-                "options": ["Skimming", "Ignoring", "Skipping", "Sleeping"],
-                "answer": "A",
-                "explanation": "Skimming helps quickly identify main ideas.",
-            },
-            {
-                "question": "What helps improve vocabulary?",
-                "options": [
-                    "Reading widely",
-                    "Avoiding books",
-                    "Watching TV only",
-                    "Sleeping more",
-                ],
-                "answer": "A",
-                "explanation": "Reading widely exposes you to new words in context.",
-            },
-        ],
-        "medium": [
-            {
-                "question": "How does context help in understanding unfamiliar words?",
-                "options": [
-                    "It doesn't help",
-                    "Surrounding words provide clues",
-                    "You must use a dictionary",
-                    "Words have no context",
-                ],
-                "answer": "B",
-                "explanation": "Context clues from surrounding text help infer word meanings.",
-            },
-            {
-                "question": "What is the relationship between critical thinking and reading?",
-                "options": [
-                    "No relationship",
-                    "Critical thinking enhances comprehension",
-                    "Reading prevents thinking",
-                    "They are opposites",
-                ],
-                "answer": "B",
-                "explanation": "Critical thinking helps analyze and evaluate what you read.",
-            },
-            {
-                "question": "Why is summarization an important reading skill?",
-                "options": [
-                    "It wastes time",
-                    "It identifies key information",
-                    "It makes reading harder",
-                    "It's not important",
-                ],
-                "answer": "B",
-                "explanation": "Summarization helps identify and retain key information.",
-            },
-        ],
-        "hard": [
-            {
-                "question": "How would you evaluate the credibility of arguments presented in a text?",
-                "options": [
-                    "Accept all claims",
-                    "Check evidence and sources",
-                    "Ignore the author",
-                    "Read only titles",
-                ],
-                "answer": "B",
-                "explanation": "Evaluating evidence and sources is essential for assessing argument credibility.",
-            },
-            {
-                "question": "What inference can be drawn when an author uses specific rhetorical devices?",
-                "options": [
-                    "No inference needed",
-                    "Author's intent and persuasion strategy",
-                    "Text has no meaning",
-                    "Language is random",
-                ],
-                "answer": "B",
-                "explanation": "Rhetorical devices reveal author's persuasive intent and communication strategy.",
-            },
-            {
-                "question": "How does analyzing text structure contribute to deeper understanding?",
-                "options": [
-                    "Structure doesn't matter",
-                    "Reveals organization and logical flow",
-                    "Only length matters",
-                    "Format is irrelevant",
-                ],
-                "answer": "B",
-                "explanation": "Understanding text structure reveals how ideas are organized and connected.",
-            },
-        ],
-    }
-
-    difficulty_questions = samples.get(difficulty, samples["medium"])
-
-    for i in range(num_questions):
-        q = difficulty_questions[i % len(difficulty_questions)].copy()
-        q["difficulty"] = difficulty
-        demo_questions.append(q)
-
-    return demo_questions
+    raise ValueError("Unable to parse OpenRouter JSON response")
 
 
 @app.route("/")
@@ -275,99 +198,57 @@ def index():
 
 @app.route("/api/generate-quiz", methods=["POST"])
 def generate_quiz():
-    """Generate quiz from uploaded PDF"""
-
-    if "pdf" not in request.files:
-        return jsonify({"error": "No PDF file uploaded"}), 400
-
-    pdf_file = request.files["pdf"]
-    if pdf_file.filename == "":
-        return jsonify({"error": "No file selected"}), 400
-
-    num_questions = int(request.form.get("num_questions", 5))
-    difficulty = request.form.get("difficulty", "medium").lower()
-
-    if num_questions < 1 or num_questions > 50:
-        return jsonify({"error": "Number of questions must be between 1 and 50"}), 400
-
-    if difficulty not in ["easy", "medium", "hard"]:
-        return jsonify({"error": "Difficulty must be easy, medium, or hard"}), 400
+    question_type = request.form.get("question_type", "mcq").lower()
+    if question_type not in ["mcq", "fill_in_the_blank", "mixed"]:
+        return jsonify({"error": "Invalid question type"}), 400
 
     try:
-        text = extract_text_from_pdf(pdf_file)
+        num_questions = max(1, int(request.form.get("num_questions", 10)))
+    except ValueError:
+        return jsonify({"error": "Invalid number of questions"}), 400
+    difficulty = request.form.get("difficulty", "medium")
+    pdf = request.files.get("pdf")
+    if not pdf:
+        return jsonify({"error": "PDF file is required"}), 400
 
-        if len(text) < 100:
-            return jsonify(
-                {
-                    "error": "PDF content is too short. Please upload a PDF with more text."
-                }
-            ), 400
+    text = extract_text_from_pdf(pdf)
+    if not text:
+        return jsonify({"error": "Could not extract text from the uploaded PDF"}), 400
 
-        # Check if API key is available
-        if (
-            not OPENROUTER_API_KEY
-            or OPENROUTER_API_KEY == "your_openrouter_api_key_here"
-        ):
-            demo_questions = generate_demo_questions(num_questions, difficulty)
-            return jsonify(
-                {
-                    "questions": demo_questions,
-                    "demo_mode": True,
-                    "message": "Running in demo mode. Add your OpenRouter API key to .env for real AI-generated questions.",
-                }
+    try:
+        if OPENROUTER_API_KEY:
+            questions = generate_openrouter_questions(
+                text, question_type, num_questions, difficulty
             )
-
-        # Split text into chunks
-        chunks = split_text_into_chunks(text)
-
-        # Distribute questions across chunks
-        questions_per_chunk = max(1, num_questions // len(chunks))
-        extra = num_questions % len(chunks)
-
-        all_questions = []
-
-        for i, chunk in enumerate(chunks):
-            chunk_questions = questions_per_chunk
-            if i < extra:
-                chunk_questions += 1
-
-            if len(all_questions) >= num_questions:
-                break
-
-            remaining = num_questions - len(all_questions)
-            chunk_questions = min(chunk_questions, remaining)
-
-            prompt = build_prompt(chunk, chunk_questions, difficulty)
-            response = call_openrouter(prompt)
-
-            if response:
-                questions = parse_questions_from_response(response)
-                all_questions.extend(questions)
-
-        # Trim to exact number
-        all_questions = all_questions[:num_questions]
-
-        # Ensure difficulty is set
-        for q in all_questions:
-            q["difficulty"] = difficulty
-
-        if not all_questions:
-            return jsonify(
-                {"error": "Failed to generate questions. Please try again."}
-            ), 500
-
-        return jsonify(
-            {
-                "questions": all_questions,
-                "demo_mode": False,
-                "total_generated": len(all_questions),
-            }
+            demo_mode = False
+        else:
+            questions = generate_demo_questions(
+                text, question_type, num_questions, difficulty
+            )
+            demo_mode = True
+    except Exception:
+        questions = generate_demo_questions(
+            text, question_type, num_questions, difficulty
         )
+        demo_mode = True
 
-    except Exception as e:
-        print(f"Error: {e}")
-        return jsonify({"error": str(e)}), 500
+    if len(questions) < num_questions:
+        fallback = generate_demo_questions(
+            text, question_type, num_questions, difficulty
+        )
+        while len(questions) < num_questions and fallback:
+            questions.append(fallback[len(questions) % len(fallback)])
+
+    questions = questions[:num_questions]
+
+    return jsonify(
+        {
+            "demo_mode": demo_mode,
+            "question_type": question_type,
+            "questions": questions,
+        }
+    )
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True)
